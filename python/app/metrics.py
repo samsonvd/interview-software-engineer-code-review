@@ -127,5 +127,82 @@ async def ingest_metrics(request_body: str) -> Dict[str, Any]:
     log = logger.bind(
         component="metrics_ingestion", request_id=request_id, received_at=received_at
     )
+    log = logger.bind(
+        component="metrics_ingestion", request_id=request_id, received_at=received_at
+    )
 
-    raise NotImplementedError()
+    # Parse request
+    body = json.loads(request_body)
+
+    project_id = body["project_id"]
+    metrics = body["metrics"]
+    trace_id = body.get("trace_id")
+
+    log = log.bind(project_id=project_id, trace_id=trace_id)
+
+    log.debug("request received")
+
+    # Load config
+    cfg = await db.get_project_config(project_id)
+    if not cfg["enabled"]:
+        log.warning("project disabled")
+        return {"status": 403, "error": "disabled"}
+
+    # Fetch context from Redis (race: might not exist yet)
+    ctx = {}
+    if trace_id:
+        key = f"ctx:{trace_id}"
+        raw = redis.get(key)
+
+        # wait for context
+        if raw is None:
+            log.info("waiting for missing context", wait_ms=cfg["context_wait_ms"])
+            time.sleep(cfg["context_wait_ms"] / 1000.0)
+            raw = redis.get(key)
+
+        if raw:
+            ctx = json.loads(raw)
+
+    # Call inference service
+    try:
+        resp = await inference.fingerprint(
+            project_id, metrics, ctx, timeout_ms=cfg["inference_timeout_ms"]
+        )
+        fingerprint_id = resp["fingerprint_id"]
+    except Exception:
+        log.error("failed to call inference service")
+        return {"status": 200, "request_id": request_id, "error": "inference failed"}
+
+    # Persist fingerprint (must succeed before returning request_id)
+    try:
+        await db.save_fingerprint(
+            request_id,
+            project_id,
+            fingerprint_id,
+            metrics=metrics,
+            context=ctx,
+            created_at=received_at,
+        )
+    except Exception:
+        log.error("failed to save fingerprint")
+
+    # Forward to downstream (no timeout/retry)
+    payload = {
+        "request_id": request_id,
+        "received_at": received_at,
+        "project_id": project_id,
+        "trace_id": trace_id,
+        "fingerprint_id": fingerprint_id,
+        "metrics": metrics,
+        "context": ctx,
+    }
+
+    await dqs.upload(project_id, payload)
+
+    log.info("metrics ingestion complete")
+    return {
+        "status": 200,
+        "project_id": project_id,
+        "request_id": request_id,
+        "fingerprint_id": fingerprint_id,
+    }
